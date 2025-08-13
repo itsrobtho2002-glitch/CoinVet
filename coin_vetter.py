@@ -22,21 +22,33 @@ def detect_chain(ca):
     """Auto-detect chain by querying GoPlus on all supported chains"""
     for chain_id in CHAIN_IDS.keys():
         url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={ca}"
-        r = requests.get(url, headers={"API-KEY": GOPLUS_API_KEY})
-        if r.status_code == 200 and r.json().get("result"):
-            data = r.json()["result"].get(ca.lower())
-            if data:
+        hdrs = {"API-KEY": GOPLUS_API_KEY} if GOPLUS_API_KEY else {}
+        r = requests.get(url, headers=hdrs, timeout=30)
+        if r.status_code == 200:
+            body = r.json()
+            result = body.get("result")
+            found = None
+            if isinstance(result, dict):
+                found = result.get(ca.lower())
+            elif isinstance(result, list) and result:
+                found = result[0]
+            if found:
                 return chain_id
     return None
 
 def get_goplus_data(chain_id, ca):
     """Fetch token security info from GoPlus API"""
     url = f"https://api.gopluslabs.io/api/v1/token_security/{chain_id}?contract_addresses={ca}"
-    r = requests.get(url, headers={"API-KEY": GOPLUS_API_KEY})
+    hdrs = {"API-KEY": GOPLUS_API_KEY} if GOPLUS_API_KEY else {}
+    r = requests.get(url, headers=hdrs, timeout=30)
     if r.status_code != 200:
         return None
-    data = r.json().get("result", {}).get(ca.lower())
-    return data
+    result = r.json().get("result")
+    if isinstance(result, dict):
+        return result.get(ca.lower())
+    if isinstance(result, list) and result:
+        return result[0]
+    return None
 
 def get_holders_data(chain_id, ca):
     """Fetch holder distribution from Moralis API (if available)"""
@@ -54,23 +66,29 @@ def get_holders_data(chain_id, ca):
         return None
 
     url = f"https://deep-index.moralis.io/api/v2/token/{ca}/holders?chain={moralis_chain}&limit=10"
-    r = requests.get(url, headers={"X-API-Key": MORALIS_API_KEY})
+    r = requests.get(url, headers={"X-API-Key": MORALIS_API_KEY}, timeout=30)
     if r.status_code != 200:
         return None
-    return r.json().get("result", [])
+    return r.json().get("result") or r.json().get("items") or []
 
-def classify_buy_zone(data):
-    """Classify Buy-Zone based on liquidity, taxes, and honeypot status"""
-    if not data:
-        return "UNKNOWN", "No data available"
+def classify_buy_zone_from_goplus(gp):
+    """Very simple liquidity/tax/honeypot check for buy-zone color."""
+    if not gp:
+        return "YELLOW", "No GoPlus data (check chain/CA)"
+    try:
+        liquidity = float(gp.get("liquidity_usd", 0) or 0)
+    except Exception:
+        liquidity = 0.0
+    try:
+        buy_tax = float(gp.get("buy_tax", 0) or 0)
+        sell_tax = float(gp.get("sell_tax", 0) or 0)
+    except Exception:
+        buy_tax = sell_tax = 0.0
 
-    liquidity = float(data.get("liquidity_usd", 0))
-    buy_tax = float(data.get("buy_tax", 0))
-    sell_tax = float(data.get("sell_tax", 0))
-    honeypot = data.get("is_honeypot", "0") == "1"
+    honeypot = str(gp.get("is_honeypot", "0")).lower() in ("1","true","yes")
 
     if honeypot:
-        return "RED", "Honeypot detected — DO NOT BUY"
+        return "RED", "Honeypot risk — do not buy"
 
     if liquidity < 5000 or buy_tax > 10 or sell_tax > 10:
         return "RED", "Low liquidity or high taxes"
@@ -79,12 +97,12 @@ def classify_buy_zone(data):
         return "YELLOW", "Medium liquidity, moderate taxes"
 
     if liquidity > 20000 and buy_tax <= 5 and sell_tax <= 5:
-        return "GREEN", "High liquidity, low taxes"
+        return "GREEN", "Higher liquidity, low taxes"
 
-    return "YELLOW", "Check details manually"
+    return "YELLOW", "Mixed signals — review details"
 
 def analyze_contract(ca):
-    """Main analysis function"""
+    """Main analysis function used by CLI and app."""
     chain_id = detect_chain(ca)
     if not chain_id:
         return f"❌ Could not detect chain for CA: {ca}"
@@ -92,7 +110,7 @@ def analyze_contract(ca):
     chain_name = CHAIN_IDS[chain_id]
     goplus_data = get_goplus_data(chain_id, ca)
     holders_data = get_holders_data(chain_id, ca)
-    zone, reason = classify_buy_zone(goplus_data)
+    zone, reason = classify_buy_zone_from_goplus(goplus_data)
 
     output = []
     output.append(["Contract Address", ca])
@@ -106,7 +124,8 @@ def analyze_contract(ca):
         output.append(["Owner Renounced", goplus_data.get("owner_renounced", "N/A")])
     if holders_data:
         top_holder = holders_data[0]
-        output.append(["Top Holder %", top_holder.get("percentage", "N/A")])
+        pct = top_holder.get("percentage") or top_holder.get("percent") or "N/A"
+        output.append(["Top Holder %", pct])
 
     print(tabulate(output, headers=["Metric", "Value"], tablefmt="pretty"))
     return {"chain_id": chain_id, "chain_name": chain_name, "goplus": goplus_data, "holders": holders_data, "buy_zone": (zone, reason)}
